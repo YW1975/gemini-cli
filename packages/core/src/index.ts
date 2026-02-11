@@ -136,7 +136,7 @@ export * from './tools/mcp-tool.js';
 export * from './tools/write-todos.js';
 
 // MCP OAuth
-export { MCPOAuthProvider } from './mcp/oauth-provider.js';
+export { MCPOAuthProvider, OAUTH_DISPLAY_MESSAGE_EVENT } from './mcp/oauth-provider.js';
 export type {
   OAuthToken,
   OAuthCredentials,

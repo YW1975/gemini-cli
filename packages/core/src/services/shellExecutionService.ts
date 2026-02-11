@@ -162,6 +162,11 @@ const getFullBufferText = (terminal: pkg.Terminal): string => {
 export class ShellExecutionService {
   private static activePtys = new Map<number, ActivePty>();
   /**
+   * Tracks process group IDs (PGIDs) of all spawned shell processes.
+   * Used to kill orphaned background processes (e.g., `cmd &`) on cleanup.
+   */
+  static trackedProcessGroups = new Set<number>();
+  /**
    * Executes a shell command using `node-pty`, capturing all output and lifecycle events.
    *
    * @param commandToExecute The exact command string to run.
@@ -264,6 +269,11 @@ export class ShellExecutionService {
         },
       });
 
+      // Track PGID for background process cleanup (detached = new process group, PGID = child.pid)
+      if (child.pid && !isWindows) {
+        ShellExecutionService.trackedProcessGroups.add(child.pid);
+      }
+
       const result = new Promise<ShellExecutionResult>((resolve) => {
         let stdoutDecoder: TextDecoder | null = null;
         let stderrDecoder: TextDecoder | null = null;
@@ -274,7 +284,6 @@ export class ShellExecutionService {
         let stderrTruncated = false;
         const outputChunks: Buffer[] = [];
         let error: Error | null = null;
-        let exited = false;
 
         let isStreamingRawContent = true;
         const MAX_SNIFF_SIZE = 4096;
@@ -378,20 +387,29 @@ export class ShellExecutionService {
         });
 
         const abortHandler = async () => {
-          if (child.pid && !exited) {
+          if (child.pid) {
             if (isWindows) {
               cpSpawn('taskkill', ['/pid', child.pid.toString(), '/f', '/t']);
             } else {
               try {
+                // Kill the entire process group — works even after shell exits
+                // because background children (cmd &) keep the PGID alive
                 process.kill(-child.pid, 'SIGTERM');
                 await new Promise((res) => setTimeout(res, SIGKILL_TIMEOUT_MS));
-                if (!exited) {
+                try {
                   process.kill(-child.pid, 'SIGKILL');
+                } catch (_e2) {
+                  // ESRCH: process group already dead — safe to ignore
                 }
               } catch (_e) {
-                if (!exited) child.kill('SIGKILL');
+                try {
+                  child.kill('SIGKILL');
+                } catch (_e3) {
+                  // child already dead — safe to ignore
+                }
               }
             }
+            ShellExecutionService.trackedProcessGroups.delete(child.pid);
           }
         };
 
@@ -405,8 +423,8 @@ export class ShellExecutionService {
         });
 
         function cleanup() {
-          exited = true;
-          abortSignal.removeEventListener('abort', abortHandler);
+          // Don't remove abort handler — process group may still have
+          // live background children that need cleanup on abort
           if (stdoutDecoder) {
             const remaining = stdoutDecoder.decode();
             if (remaining) {
@@ -493,12 +511,16 @@ export class ShellExecutionService {
 
         this.activePtys.set(ptyProcess.pid, { ptyProcess, headlessTerminal });
 
+        // Track PGID for background process cleanup
+        if (ptyProcess.pid) {
+          ShellExecutionService.trackedProcessGroups.add(ptyProcess.pid);
+        }
+
         let processingChain = Promise.resolve();
         let decoder: TextDecoder | null = null;
         let output: string | AnsiOutput | null = null;
         const outputChunks: Buffer[] = [];
         const error: Error | null = null;
-        let exited = false;
 
         let isStreamingRawContent = true;
         const MAX_SNIFF_SIZE = 4096;
@@ -657,8 +679,8 @@ export class ShellExecutionService {
 
         ptyProcess.onExit(
           ({ exitCode, signal }: { exitCode: number; signal?: number }) => {
-            exited = true;
-            abortSignal.removeEventListener('abort', abortHandler);
+            // Don't remove abort handler — process group may still have
+            // live background children that need cleanup on abort
             this.activePtys.delete(ptyProcess.pid);
 
             const finalize = () => {
@@ -701,26 +723,36 @@ export class ShellExecutionService {
         );
 
         const abortHandler = async () => {
-          if (ptyProcess.pid && !exited) {
+          if (ptyProcess.pid) {
             if (os.platform() === 'win32') {
               ptyProcess.kill();
             } else {
               try {
-                // Kill the entire process group
+                // Kill the entire process group — works even after shell exits
+                // because background children (cmd &) keep the PGID alive
                 process.kill(-ptyProcess.pid, 'SIGTERM');
                 await new Promise((res) => setTimeout(res, SIGKILL_TIMEOUT_MS));
-                if (!exited) {
+                try {
                   process.kill(-ptyProcess.pid, 'SIGKILL');
+                } catch (_e2) {
+                  // ESRCH: process group already dead — safe to ignore
                 }
               } catch (_e) {
-                // Fallback to killing just the process if the group kill fails
-                ptyProcess.kill('SIGTERM');
-                await new Promise((res) => setTimeout(res, SIGKILL_TIMEOUT_MS));
-                if (!exited) {
-                  ptyProcess.kill('SIGKILL');
+                try {
+                  // Fallback to killing just the process if the group kill fails
+                  ptyProcess.kill('SIGTERM');
+                  await new Promise((res) => setTimeout(res, SIGKILL_TIMEOUT_MS));
+                  try {
+                    ptyProcess.kill('SIGKILL');
+                  } catch (_e3) {
+                    // already dead
+                  }
+                } catch (_e4) {
+                  // already dead
                 }
               }
             }
+            ShellExecutionService.trackedProcessGroups.delete(ptyProcess.pid);
           }
         };
 
@@ -817,6 +849,40 @@ export class ShellExecutionService {
         }
       }
     }
+  }
+
+  /**
+   * Kill all tracked process groups. Used during agent cleanup to ensure
+   * background processes (spawned with `cmd &`) are terminated.
+   * Safe to call even if process groups are already dead (ESRCH is caught).
+   */
+  static killAllTrackedProcessGroups(): void {
+    const isWindows = os.platform() === 'win32';
+    if (isWindows) {
+      ShellExecutionService.trackedProcessGroups.clear();
+      return;
+    }
+
+    for (const pgid of ShellExecutionService.trackedProcessGroups) {
+      try {
+        process.kill(-pgid, 'SIGTERM');
+      } catch (_e) {
+        // ESRCH: process group already dead
+      }
+    }
+
+    // Follow up with SIGKILL after grace period
+    const pgids = [...ShellExecutionService.trackedProcessGroups];
+    ShellExecutionService.trackedProcessGroups.clear();
+    setTimeout(() => {
+      for (const pgid of pgids) {
+        try {
+          process.kill(-pgid, 'SIGKILL');
+        } catch (_e) {
+          // ESRCH: already dead
+        }
+      }
+    }, SIGKILL_TIMEOUT_MS);
   }
 
   /**
