@@ -1,5 +1,5 @@
 {
-  "name": "@google/gemini-cli-core",
+  "name": "@margay/agent-core",
   "version": "0.28.0",
   "description": "Gemini CLI Core",
   "license": "Apache-2.0",

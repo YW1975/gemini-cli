@@ -27,7 +27,10 @@ import {
   sanitizeEnvironment,
   type EnvironmentSanitizationConfig,
 } from './environmentSanitization.js';
-import { killProcessGroup } from '../utils/process-utils.js';
+import {
+  killProcessGroup,
+  SIGKILL_TIMEOUT_MS,
+} from '../utils/process-utils.js';
 const { Terminal } = pkg;
 
 const MAX_CHILD_PROCESS_BUFFER_SIZE = 16 * 1024 * 1024; // 16MB
@@ -200,6 +203,11 @@ export class ShellExecutionService {
     Set<(event: ShellOutputEvent) => void>
   >();
   /**
+   * Tracks process group IDs (PGIDs) of all spawned shell processes.
+   * Used by Margay to kill orphaned background processes (e.g., `cmd &`) on cleanup.
+   */
+  static trackedProcessGroups = new Set<number>();
+  /**
    * Executes a shell command using `node-pty`, capturing all output and lifecycle events.
    *
    * @param commandToExecute The exact command string to run.
@@ -320,6 +328,10 @@ export class ShellExecutionService {
           process: child,
           state,
         });
+        // Track PGID for background process cleanup (detached = new process group, PGID = child.pid)
+        if (!isWindows) {
+          ShellExecutionService.trackedProcessGroups.add(child.pid);
+        }
       }
 
       const result = new Promise<ShellExecutionResult>((resolve) => {
@@ -429,6 +441,7 @@ export class ShellExecutionService {
             this.activeChildProcesses.delete(child.pid);
             this.activeResolvers.delete(child.pid);
             this.activeListeners.delete(child.pid);
+            ShellExecutionService.trackedProcessGroups.delete(child.pid);
           }
 
           resolve({
@@ -588,6 +601,11 @@ export class ShellExecutionService {
           headlessTerminal,
           maxSerializedLines: shellExecutionConfig.maxSerializedLines,
         });
+
+        // Track PGID for background process cleanup
+        if (ptyProcess.pid) {
+          ShellExecutionService.trackedProcessGroups.add(ptyProcess.pid);
+        }
 
         let processingChain = Promise.resolve();
         let decoder: TextDecoder | null = null;
@@ -806,6 +824,7 @@ export class ShellExecutionService {
               onOutputEvent(event);
               ShellExecutionService.emitEvent(ptyProcess.pid, event);
               this.activeListeners.delete(ptyProcess.pid);
+              ShellExecutionService.trackedProcessGroups.delete(ptyProcess.pid);
 
               const finalBuffer = Buffer.concat(outputChunks);
 
@@ -992,6 +1011,7 @@ export class ShellExecutionService {
 
     this.activeResolvers.delete(pid);
     this.activeListeners.delete(pid);
+    ShellExecutionService.trackedProcessGroups.delete(pid);
   }
 
   /**
@@ -1169,5 +1189,39 @@ export class ShellExecutionService {
         }
       }
     }
+  }
+
+  /**
+   * Kill all tracked process groups. Used by Margay during agent cleanup to
+   * ensure background processes (spawned with `cmd &`) are terminated.
+   * Safe to call even if process groups are already dead (ESRCH is caught).
+   */
+  static killAllTrackedProcessGroups(): void {
+    const isWindows = os.platform() === 'win32';
+    if (isWindows) {
+      ShellExecutionService.trackedProcessGroups.clear();
+      return;
+    }
+
+    for (const pgid of ShellExecutionService.trackedProcessGroups) {
+      try {
+        process.kill(-pgid, 'SIGTERM');
+      } catch (_e) {
+        // ESRCH: process group already dead
+      }
+    }
+
+    // Follow up with SIGKILL after grace period
+    const pgids = [...ShellExecutionService.trackedProcessGroups];
+    ShellExecutionService.trackedProcessGroups.clear();
+    setTimeout(() => {
+      for (const pgid of pgids) {
+        try {
+          process.kill(-pgid, 'SIGKILL');
+        } catch (_e) {
+          // ESRCH: already dead
+        }
+      }
+    }, SIGKILL_TIMEOUT_MS);
   }
 }
