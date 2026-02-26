@@ -54,13 +54,27 @@ export enum AuthType {
   USE_VERTEX_AI = 'vertex-ai',
   LEGACY_CLOUD_SHELL = 'cloud-shell',
   COMPUTE_ADC = 'compute-default-credentials',
+  USE_OPENAI = 'openai',
+  USE_ANTHROPIC = 'anthropic',
 }
 
 export type ContentGeneratorConfig = {
+  model?: string;
   apiKey?: string;
   vertexai?: boolean;
-  authType?: AuthType;
-  proxy?: string;
+  authType?: AuthType | undefined;
+  timeout?: number;
+  maxRetries?: number;
+  samplingParams?: {
+    top_p?: number;
+    top_k?: number;
+    repetition_penalty?: number;
+    presence_penalty?: number;
+    frequency_penalty?: number;
+    temperature?: number;
+    max_tokens?: number;
+  };
+  proxy?: string | undefined;
 };
 
 export async function createContentGeneratorConfig(
@@ -76,7 +90,11 @@ export async function createContentGeneratorConfig(
     undefined;
   const googleCloudLocation = process.env['GOOGLE_CLOUD_LOCATION'] || undefined;
 
+  const openAiApiKey = process.env['OPENAI_API_KEY'] || undefined;
+  const anthropicApiKey = process.env['ANTHROPIC_API_KEY'] || undefined;
+
   const contentGeneratorConfig: ContentGeneratorConfig = {
+    model: config.getModel(),
     authType,
     proxy: config?.getProxy(),
   };
@@ -103,6 +121,16 @@ export async function createContentGeneratorConfig(
     contentGeneratorConfig.apiKey = googleApiKey;
     contentGeneratorConfig.vertexai = true;
 
+    return contentGeneratorConfig;
+  }
+
+  if (authType === AuthType.USE_OPENAI && openAiApiKey) {
+    contentGeneratorConfig.apiKey = openAiApiKey;
+    return contentGeneratorConfig;
+  }
+
+  if (authType === AuthType.USE_ANTHROPIC && anthropicApiKey) {
+    contentGeneratorConfig.apiKey = anthropicApiKey;
     return contentGeneratorConfig;
   }
 
@@ -186,6 +214,37 @@ export async function createContentGenerator(
       });
       return new LoggingContentGenerator(googleGenAI.models, gcConfig);
     }
+
+    // Handle OpenAI authType
+    if (config.authType === AuthType.USE_OPENAI) {
+      if (!config.apiKey) {
+        throw new Error('OpenAI API key is required');
+      }
+      const { OpenAIContentGenerator } = await import(
+        './openaiContentGenerator.js'
+      );
+      return new OpenAIContentGenerator(
+        config.apiKey,
+        config.model || gcConfig.getModel() || 'gpt-4.1-mini',
+        gcConfig,
+      );
+    }
+
+    // Handle Anthropic authType
+    if (config.authType === AuthType.USE_ANTHROPIC) {
+      if (!config.apiKey) {
+        throw new Error('Anthropic API key is required');
+      }
+      const { AnthropicContentGenerator } = await import(
+        './anthropicContentGenerator.js'
+      );
+      return new AnthropicContentGenerator(
+        config.apiKey,
+        config.model || gcConfig.getModel() || 'claude-sonnet-4-20250514',
+        gcConfig,
+      );
+    }
+
     throw new Error(
       `Error creating contentGenerator: Unsupported authType: ${config.authType}`,
     );
