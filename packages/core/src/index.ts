@@ -154,6 +154,7 @@ export * from './tools/read-many-files.js';
 export * from './tools/mcp-client.js';
 export * from './tools/mcp-tool.js';
 export * from './tools/write-todos.js';
+export * from './tools/activate-skill.js';
 
 // MCP OAuth
 export {
