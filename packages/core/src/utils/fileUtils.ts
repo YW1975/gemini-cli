@@ -16,12 +16,45 @@ import { BINARY_EXTENSIONS } from './ignorePatterns.js';
 import { createRequire as createModuleRequire } from 'node:module';
 import { debugLogger } from './debugLogger.js';
 
-const requireModule = createModuleRequire(import.meta.url);
+// webpack may compile createRequire(import.meta.url) to undefined at build time
+// (static analysis replaces the expression with a /* createRequire() */ undefined stub).
+// Guard against this and provide a fallback path resolution.
+let requireModule: NodeRequire | undefined;
+try {
+  const req = createModuleRequire(import.meta.url);
+  if (typeof req?.resolve === 'function') {
+    requireModule = req;
+  }
+} catch {
+  // createRequire not available in this runtime context
+}
 
 export async function readWasmBinaryFromDisk(
   specifier: string,
 ): Promise<Uint8Array> {
-  const resolvedPath = requireModule.resolve(specifier);
+  let resolvedPath: string | undefined;
+  if (requireModule) {
+    resolvedPath = requireModule.resolve(specifier);
+  } else {
+    // Fallback: walk up from __dirname to find node_modules containing the specifier.
+    // Mimics Node's module resolution. Needed because webpack may compile createRequire()
+    // to undefined, and __dirname depth varies (.webpack/main/ vs .webpack/arm64/main/).
+    let dir = __dirname;
+    while (dir !== path.dirname(dir)) {
+      const candidate = path.resolve(dir, 'node_modules', specifier);
+      if (fs.existsSync(candidate)) {
+        resolvedPath = candidate;
+        break;
+      }
+      dir = path.dirname(dir);
+    }
+    if (!resolvedPath) {
+      throw new Error(
+        `readWasmBinaryFromDisk: could not resolve "${specifier}" — ` +
+          `walked up from ${__dirname} to filesystem root (createRequire unavailable in bundled context)`,
+      );
+    }
+  }
   const buffer = await fsPromises.readFile(resolvedPath);
   return new Uint8Array(buffer);
 }
@@ -38,7 +71,11 @@ export async function loadWasmBinary(
   } catch (error) {
     try {
       return await readWasmBinaryFromDisk(fallbackSpecifier);
-    } catch {
+    } catch (fallbackError) {
+      debugLogger.debug(
+        'readWasmBinaryFromDisk fallback failed:',
+        fallbackError,
+      );
       throw error;
     }
   }
