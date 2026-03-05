@@ -968,7 +968,9 @@ export class OpenAIContentGenerator implements ContentGenerator {
                 name: func.name,
                 description: func.description,
                 parameters: this.convertGeminiParametersToOpenAI(
-                  (func.parameters || {}) as Record<string, unknown>,
+                  (func.parametersJsonSchema ||
+                    func.parameters ||
+                    {}) as Record<string, unknown>,
                 ),
               },
             });
