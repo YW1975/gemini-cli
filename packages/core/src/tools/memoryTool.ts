@@ -133,7 +133,10 @@ async function readMemoryFileContent(): Promise<string> {
 function computeNewContent(currentContent: string, fact: string): string {
   let processedText = fact.trim();
   processedText = processedText.replace(/^(-+\s*)+/, '').trim();
-  const newMemoryItem = `- ${processedText}`;
+  // Prefix with date stamp so memories carry temporal context
+  const now = new Date();
+  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  const newMemoryItem = `- [${dateStr}] ${processedText}`;
 
   const headerIndex = currentContent.indexOf(MEMORY_SECTION_HEADER);
 
